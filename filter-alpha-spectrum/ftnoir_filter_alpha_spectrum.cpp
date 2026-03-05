@@ -121,6 +121,7 @@ void alpha_spectrum::filter(const double* input, double* output)
         std::fill(last_noise, last_noise + axis_count, 0.0);
         std::fill(raw_brownian_energy, raw_brownian_energy + axis_count, 0.0);
         std::fill(filtered_brownian_energy, filtered_brownian_energy + axis_count, 0.0);
+        std::copy(input, input + axis_count, predicted_next_output);
         coupling_residual = 0.0;
         last_Z = std::max(std::fabs(input[TZ]), 0.3);
         initialize_uniform(rot_mode_prob);
@@ -141,6 +142,7 @@ void alpha_spectrum::filter(const double* input, double* output)
     const bool adaptive_mode = *s.adaptive_mode;
     const bool ema_enabled = *s.ema_enabled;
     const bool brownian_enabled = *s.brownian_enabled;
+    const bool predictive_enabled = *s.predictive_enabled;
     const bool mtm_enabled = *s.mtm_enabled;
     auto& telemetry = detail::alpha_spectrum::shared_calibration_telemetry();
     telemetry.active.store(true, std::memory_order_relaxed);
@@ -172,6 +174,12 @@ void alpha_spectrum::filter(const double* input, double* output)
     const double pos_alpha_max = std::max(pos_alpha_min, pos_alpha_max_source);
     const double pos_curve = *s.pos_curve;
     const double pos_deadzone = *s.pos_deadzone;
+    const double brownian_head_gain = *s.brownian_head_gain;
+    const double adaptive_threshold_lift = *s.adaptive_threshold_lift;
+    const double predictive_head_gain = *s.predictive_head_gain;
+    const double mtm_shoulder_base = *s.mtm_shoulder_base;
+    const double ngc_kappa = *s.ngc_kappa;
+    const double ngc_nominal_z = *s.ngc_nominal_z;
 
     // NGC: explicit depth-scale commutator coupling residual.
     {
@@ -180,7 +188,7 @@ void alpha_spectrum::filter(const double* input, double* output)
         last_Z = curr_Z;
 
         const double radial_pos = std::hypot(input[TX], input[TY]);
-        coupling_residual = kappa * std::fabs(delta_Z) * (radial_pos / (nominal_Z * nominal_Z));
+        coupling_residual = ngc_kappa * std::fabs(delta_Z) * (radial_pos / (ngc_nominal_z * ngc_nominal_z));
         coupling_residual = std::clamp(coupling_residual, 0.0, 3.0);
     }
 
@@ -194,15 +202,19 @@ void alpha_spectrum::filter(const double* input, double* output)
     double pos_objective_sum = 0.0;
     double rot_brownian_raw_sum = 0.0;
     double rot_brownian_filtered_sum = 0.0;
+    double rot_predictive_error_sum = 0.0;
     double pos_brownian_raw_sum = 0.0;
     double pos_brownian_filtered_sum = 0.0;
+    double pos_predictive_error_sum = 0.0;
     double rot_ema_drive_sum = 0.0;
     double rot_brownian_drive_sum = 0.0;
     double rot_adaptive_drive_sum = 0.0;
+    double rot_predictive_drive_sum = 0.0;
     double rot_mtm_drive_sum = 0.0;
     double pos_ema_drive_sum = 0.0;
     double pos_brownian_drive_sum = 0.0;
     double pos_adaptive_drive_sum = 0.0;
+    double pos_predictive_drive_sum = 0.0;
     double pos_mtm_drive_sum = 0.0;
 
     for (int i = TX; i <= Roll; i++)
@@ -289,7 +301,8 @@ void alpha_spectrum::filter(const double* input, double* output)
             brownian_enabled && raw_brownian > 1e-12 ?
                 clamp01(1.0 - filtered_brownian / raw_brownian) : 0.0;
 
-        double alpha_brownian = alpha_min + (alpha_max - alpha_min) * std::pow(brownian_drive, curve);
+        const double tuned_brownian_drive = clamp01(brownian_drive * brownian_head_gain);
+        double alpha_brownian = alpha_min + (alpha_max - alpha_min) * std::pow(tuned_brownian_drive, curve);
         if (adaptive_mode)
             alpha_brownian += adaptive_boost * activity * (1.0 - alpha_brownian);
         alpha_brownian = std::clamp(alpha_brownian, 0.0, 1.0);
@@ -301,25 +314,23 @@ void alpha_spectrum::filter(const double* input, double* output)
             bool is_ema;
             bool is_brownian;
             bool is_adaptive;
+            bool is_predictive;
         };
 
         std::array<head_candidate, hydra_head_capacity> heads {{
-            {false, input_value, 0.0, false, false, false},
-            {false, input_value, 0.0, false, false, false},
-            {false, input_value, 0.0, false, false, false},
-            {false, input_value, 0.0, false, false, false}
+            {false, input_value, 0.0, false, false, false, false},
+            {false, input_value, 0.0, false, false, false, false},
+            {false, input_value, 0.0, false, false, false, false},
+            {false, input_value, 0.0, false, false, false, false}
         }};
 
         int head_count = 0;
-        auto add_head = [&](bool enabled, double sample, bool is_ema, bool is_brownian, bool is_adaptive) {
+        auto add_head = [&](bool enabled, double sample, bool is_ema, bool is_brownian, bool is_adaptive, bool is_predictive) {
             if (!enabled || head_count >= hydra_head_capacity)
                 return;
-            heads[head_count++] = {true, sample, 0.0, is_ema, is_brownian, is_adaptive};
+            heads[head_count++] = {true, sample, 0.0, is_ema, is_brownian, is_adaptive, is_predictive};
         };
 
-        // Adaptive head uses ~15% higher activation threshold to mimic a
-        // stricter regime detector before committing stronger response.
-        static constexpr double adaptive_threshold_lift = 0.15;
         const double adaptive_gate_input = std::max(norm_innovation, brownian_drive);
         const double adaptive_gate = remap_with_threshold(adaptive_gate_input, adaptive_threshold_lift);
         double alpha_adaptive = alpha_min + (alpha_max - alpha_min) * std::pow(adaptive_gate, curve);
@@ -332,15 +343,27 @@ void alpha_spectrum::filter(const double* input, double* output)
             filtered_prev + alpha_brownian * (input_value - filtered_prev);
         const double adaptive_head_sample =
             filtered_prev + alpha_adaptive * (input_value - filtered_prev);
+        const double predictive_head_sample =
+            filtered_prev + predictive_head_gain * (predicted_next_output[i] - filtered_prev);
 
-        add_head(ema_enabled, ema_head_sample, true, false, false);
-        add_head(brownian_enabled, brownian_head_sample, false, true, false);
-        add_head(adaptive_mode, adaptive_head_sample, false, false, true);
+        const double predictive_error = std::fabs(input_value - predictive_head_sample);
+        if (is_rotation)
+            rot_predictive_error_sum += predictive_error;
+        else
+            pos_predictive_error_sum += predictive_error;
+
+        add_head(ema_enabled, ema_head_sample, true, false, false, false);
+        add_head(brownian_enabled, brownian_head_sample, false, true, false, false);
+        add_head(adaptive_mode, adaptive_head_sample, false, false, true, false);
+        add_head(predictive_enabled, predictive_head_sample, false, false, false, true);
 
         double ema_share = 0.0;
         double brownian_share = 0.0;
         double adaptive_share = 0.0;
-        const double shoulder_gain = mtm_enabled ? (0.5 + 0.5 * mode_e) : 0.0;
+        double predictive_share = 0.0;
+        const double shoulder_gain = mtm_enabled ?
+            std::clamp(mtm_shoulder_base + (1.0 - mtm_shoulder_base) * mode_e, 0.0, 1.0) :
+            0.0;
         double composed_output = input_value;
 
         if (head_count == 0)
@@ -357,6 +380,8 @@ void alpha_spectrum::filter(const double* input, double* output)
                 brownian_share = 1.0;
             if (heads[0].is_adaptive)
                 adaptive_share = 1.0;
+            if (heads[0].is_predictive)
+                predictive_share = 1.0;
         }
         else
         {
@@ -408,6 +433,8 @@ void alpha_spectrum::filter(const double* input, double* output)
                     brownian_share += heads[h].weight;
                 if (heads[h].is_adaptive)
                     adaptive_share += heads[h].weight;
+                if (heads[h].is_predictive)
+                    predictive_share += heads[h].weight;
             }
 
             composed_output = filtered_prev + shoulder_gain * (hydra_sample - filtered_prev);
@@ -415,25 +442,38 @@ void alpha_spectrum::filter(const double* input, double* output)
 
         if (!mtm_enabled && head_count > 1)
         {
-            // deterministic no-MTM path: EMA first, then Brownian, then Adaptive.
+            // deterministic no-MTM path: EMA -> Brownian -> Adaptive -> Predictive.
             const bool use_ema = ema_enabled;
             const bool use_brownian = !use_ema && brownian_enabled;
             const bool use_adaptive = !use_ema && !use_brownian && adaptive_mode;
+            const bool use_predictive = !use_ema && !use_brownian && !use_adaptive && predictive_enabled;
             ema_share = use_ema ? 1.0 : 0.0;
             brownian_share = use_brownian ? 1.0 : 0.0;
             adaptive_share = use_adaptive ? 1.0 : 0.0;
+            predictive_share = use_predictive ? 1.0 : 0.0;
             if (use_ema)
                 composed_output = ema_head_sample;
             else if (use_brownian)
                 composed_output = brownian_head_sample;
             else if (use_adaptive)
                 composed_output = adaptive_head_sample;
+            else if (use_predictive)
+                composed_output = predictive_head_sample;
             else
                 composed_output = input_value;
         }
 
         last_output[i] = composed_output;
         output[i] = last_output[i];
+
+        double prediction_delta = last_output[i] - filtered_prev;
+        if (is_rotation && std::fabs(prediction_delta) > half_turn)
+        {
+            const double wrap = std::copysign(full_turn, prediction_delta);
+            prediction_delta -= wrap;
+        }
+        const double predicted_velocity = prediction_delta / safe_dt;
+        predicted_next_output[i] = last_output[i] + predicted_velocity * safe_dt;
 
         double filtered_delta = last_output[i] - filtered_prev;
         if (is_rotation && std::fabs(filtered_delta) > half_turn)
@@ -453,6 +493,7 @@ void alpha_spectrum::filter(const double* input, double* output)
             rot_ema_drive_sum += ema_share;
             rot_brownian_drive_sum += brownian_share;
             rot_adaptive_drive_sum += adaptive_share;
+            rot_predictive_drive_sum += predictive_share;
             rot_mtm_drive_sum += shoulder_gain;
         }
         else
@@ -462,6 +503,7 @@ void alpha_spectrum::filter(const double* input, double* output)
             pos_ema_drive_sum += ema_share;
             pos_brownian_drive_sum += brownian_share;
             pos_adaptive_drive_sum += adaptive_share;
+            pos_predictive_drive_sum += predictive_share;
             pos_mtm_drive_sum += shoulder_gain;
         }
 
@@ -470,17 +512,21 @@ void alpha_spectrum::filter(const double* input, double* output)
 
     const double rot_brownian_raw_avg = rot_brownian_raw_sum / 3.0;
     const double rot_brownian_filtered_avg = rot_brownian_filtered_sum / 3.0;
+    const double rot_predictive_error_avg = rot_predictive_error_sum / 3.0;
     const double pos_brownian_raw_avg = pos_brownian_raw_sum / 3.0;
     const double pos_brownian_filtered_avg = pos_brownian_filtered_sum / 3.0;
+    const double pos_predictive_error_avg = pos_predictive_error_sum / 3.0;
     const double rot_brownian_delta_avg = rot_brownian_raw_avg - rot_brownian_filtered_avg;
     const double pos_brownian_delta_avg = pos_brownian_raw_avg - pos_brownian_filtered_avg;
     const double rot_ema_drive_avg = rot_ema_drive_sum / 3.0;
     const double rot_brownian_drive_avg = rot_brownian_drive_sum / 3.0;
     const double rot_adaptive_drive_avg = rot_adaptive_drive_sum / 3.0;
+    const double rot_predictive_drive_avg = rot_predictive_drive_sum / 3.0;
     const double rot_mtm_drive_avg = rot_mtm_drive_sum / 3.0;
     const double pos_ema_drive_avg = pos_ema_drive_sum / 3.0;
     const double pos_brownian_drive_avg = pos_brownian_drive_sum / 3.0;
     const double pos_adaptive_drive_avg = pos_adaptive_drive_sum / 3.0;
+    const double pos_predictive_drive_avg = pos_predictive_drive_sum / 3.0;
     const double pos_mtm_drive_avg = pos_mtm_drive_sum / 3.0;
 
     const double rot_brownian_damped =
@@ -522,17 +568,21 @@ void alpha_spectrum::filter(const double* input, double* output)
     telemetry.rot_brownian_filtered.store(rot_brownian_filtered_avg, std::memory_order_relaxed);
     telemetry.rot_brownian_delta.store(rot_brownian_delta_avg, std::memory_order_relaxed);
     telemetry.rot_brownian_damped.store(rot_brownian_damped, std::memory_order_relaxed);
+    telemetry.rot_predictive_error.store(rot_predictive_error_avg, std::memory_order_relaxed);
     telemetry.pos_brownian_raw.store(pos_brownian_raw_avg, std::memory_order_relaxed);
     telemetry.pos_brownian_filtered.store(pos_brownian_filtered_avg, std::memory_order_relaxed);
     telemetry.pos_brownian_delta.store(pos_brownian_delta_avg, std::memory_order_relaxed);
     telemetry.pos_brownian_damped.store(pos_brownian_damped, std::memory_order_relaxed);
+    telemetry.pos_predictive_error.store(pos_predictive_error_avg, std::memory_order_relaxed);
     telemetry.rot_ema_drive.store(rot_ema_drive_avg, std::memory_order_relaxed);
     telemetry.rot_brownian_drive.store(rot_brownian_drive_avg, std::memory_order_relaxed);
     telemetry.rot_adaptive_drive.store(rot_adaptive_drive_avg, std::memory_order_relaxed);
+    telemetry.rot_predictive_drive.store(rot_predictive_drive_avg, std::memory_order_relaxed);
     telemetry.rot_mtm_drive.store(rot_mtm_drive_avg, std::memory_order_relaxed);
     telemetry.pos_ema_drive.store(pos_ema_drive_avg, std::memory_order_relaxed);
     telemetry.pos_brownian_drive.store(pos_brownian_drive_avg, std::memory_order_relaxed);
     telemetry.pos_adaptive_drive.store(pos_adaptive_drive_avg, std::memory_order_relaxed);
+    telemetry.pos_predictive_drive.store(pos_predictive_drive_avg, std::memory_order_relaxed);
     telemetry.pos_mtm_drive.store(pos_mtm_drive_avg, std::memory_order_relaxed);
     telemetry.rot_mode_expectation.store(rot_mode_e, std::memory_order_relaxed);
     telemetry.pos_mode_expectation.store(pos_mode_e, std::memory_order_relaxed);

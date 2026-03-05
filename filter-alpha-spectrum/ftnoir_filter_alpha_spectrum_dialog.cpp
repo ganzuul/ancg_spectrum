@@ -1,7 +1,11 @@
 #include "ftnoir_filter_alpha_spectrum.h"
 
 #include <QCheckBox>
+#include <QFontDatabase>
+#include <QFontMetrics>
+#include <QLabel>
 #include <QPushButton>
+#include <QSizePolicy>
 #include <QSlider>
 #include <QSignalBlocker>
 #include <QTimer>
@@ -28,6 +32,7 @@ dialog_alpha_spectrum::dialog_alpha_spectrum()
     tie_setting(s.adaptive_mode, ui.adaptive_mode_check);
     tie_setting(s.ema_enabled, ui.ema_enabled_check);
     tie_setting(s.brownian_enabled, ui.brownian_enabled_check);
+    tie_setting(s.predictive_enabled, ui.predictive_enabled_check);
     tie_setting(s.mtm_enabled, ui.mtm_enabled_check);
 
     tie_setting(s.rot_alpha_min, ui.rot_min_slider);
@@ -38,6 +43,12 @@ dialog_alpha_spectrum::dialog_alpha_spectrum()
     tie_setting(s.pos_curve, ui.pos_curve_slider);
     tie_setting(s.rot_deadzone, ui.rot_deadzone_slider);
     tie_setting(s.pos_deadzone, ui.pos_deadzone_slider);
+    tie_setting(s.brownian_head_gain, ui.brownian_gain_slider);
+    tie_setting(s.adaptive_threshold_lift, ui.adaptive_threshold_slider);
+    tie_setting(s.predictive_head_gain, ui.predictive_gain_slider);
+    tie_setting(s.mtm_shoulder_base, ui.mtm_shoulder_slider);
+    tie_setting(s.ngc_kappa, ui.ngc_kappa_slider);
+    tie_setting(s.ngc_nominal_z, ui.ngc_nominal_z_slider);
 
     tie_setting(s.rot_alpha_min, ui.rot_min_label,
                 [](double x) { return QStringLiteral("%1%").arg(x * 100.0, 0, 'f', 1); });
@@ -55,6 +66,18 @@ dialog_alpha_spectrum::dialog_alpha_spectrum()
                 [](double x) { return tr("%1°").arg(x, 0, 'f', 3); });
     tie_setting(s.pos_deadzone, ui.pos_deadzone_label,
                 [](double x) { return tr("%1mm").arg(x, 0, 'f', 3); });
+    tie_setting(s.brownian_head_gain, ui.brownian_gain_label,
+                [](double x) { return QStringLiteral("%1x").arg(x, 0, 'f', 2); });
+    tie_setting(s.adaptive_threshold_lift, ui.adaptive_threshold_label,
+                [](double x) { return QStringLiteral("%1%").arg(x * 100.0, 0, 'f', 1); });
+    tie_setting(s.predictive_head_gain, ui.predictive_gain_label,
+                [](double x) { return QStringLiteral("%1x").arg(x, 0, 'f', 2); });
+    tie_setting(s.mtm_shoulder_base, ui.mtm_shoulder_label,
+                [](double x) { return QStringLiteral("%1%").arg(x * 100.0, 0, 'f', 1); });
+    tie_setting(s.ngc_kappa, ui.ngc_kappa_label,
+                [](double x) { return QStringLiteral("%1").arg(x, 0, 'f', 3); });
+    tie_setting(s.ngc_nominal_z, ui.ngc_nominal_z_label,
+                [](double x) { return QStringLiteral("%1m").arg(x, 0, 'f', 2); });
 
     connect(ui.rot_min_slider, &QSlider::valueChanged, this,
             [&](int v) { if (ui.rot_max_slider->value() < v) ui.rot_max_slider->setValue(v); });
@@ -68,6 +91,21 @@ dialog_alpha_spectrum::dialog_alpha_spectrum()
 
     connect(ui.reset_defaults_button, &QPushButton::clicked, this,
             [this] { reset_to_defaults(); });
+
+    const QFont fixed_font = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    ui.telemetry_status_value->setFont(fixed_font);
+    ui.telemetry_rot_value->setFont(fixed_font);
+    ui.telemetry_pos_value->setFont(fixed_font);
+    ui.telemetry_rot_brownian_value->setFont(fixed_font);
+    ui.telemetry_pos_brownian_value->setFont(fixed_font);
+    ui.telemetry_rot_contrib_value->setFont(fixed_font);
+    ui.telemetry_pos_contrib_value->setFont(fixed_font);
+    ui.telemetry_predictive_error_value->setFont(fixed_font);
+
+    const QFontMetrics fm(fixed_font);
+    const QString status_template = QStringLiteral("Mon|E1 B1 A1 P1 M1|rE0.000 rP0.000 pE0.000 pP0.000 k0.000");
+    ui.telemetry_status_value->setMinimumWidth(fm.horizontalAdvance(status_template));
+    ui.telemetry_status_value->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
     auto* calib_timer = new QTimer(this);
     calib_timer->setInterval(100);
@@ -105,17 +143,21 @@ void dialog_alpha_spectrum::pull_telemetry_into_ui(bool commit_to_settings)
     const double rot_brownian_filtered = telemetry.rot_brownian_filtered.load(std::memory_order_relaxed);
     const double rot_brownian_delta = telemetry.rot_brownian_delta.load(std::memory_order_relaxed);
     const double rot_brownian_damped = telemetry.rot_brownian_damped.load(std::memory_order_relaxed);
+    const double rot_predictive_error = telemetry.rot_predictive_error.load(std::memory_order_relaxed);
     const double pos_brownian_raw = telemetry.pos_brownian_raw.load(std::memory_order_relaxed);
     const double pos_brownian_filtered = telemetry.pos_brownian_filtered.load(std::memory_order_relaxed);
     const double pos_brownian_delta = telemetry.pos_brownian_delta.load(std::memory_order_relaxed);
     const double pos_brownian_damped = telemetry.pos_brownian_damped.load(std::memory_order_relaxed);
+    const double pos_predictive_error = telemetry.pos_predictive_error.load(std::memory_order_relaxed);
     const double rot_ema_drive = telemetry.rot_ema_drive.load(std::memory_order_relaxed);
     const double rot_brownian_drive = telemetry.rot_brownian_drive.load(std::memory_order_relaxed);
     const double rot_adaptive_drive = telemetry.rot_adaptive_drive.load(std::memory_order_relaxed);
+    const double rot_predictive_drive = telemetry.rot_predictive_drive.load(std::memory_order_relaxed);
     const double rot_mtm_drive = telemetry.rot_mtm_drive.load(std::memory_order_relaxed);
     const double pos_ema_drive = telemetry.pos_ema_drive.load(std::memory_order_relaxed);
     const double pos_brownian_drive = telemetry.pos_brownian_drive.load(std::memory_order_relaxed);
     const double pos_adaptive_drive = telemetry.pos_adaptive_drive.load(std::memory_order_relaxed);
+    const double pos_predictive_drive = telemetry.pos_predictive_drive.load(std::memory_order_relaxed);
     const double pos_mtm_drive = telemetry.pos_mtm_drive.load(std::memory_order_relaxed);
     const double rot_mode_expectation = telemetry.rot_mode_expectation.load(std::memory_order_relaxed);
     const double pos_mode_expectation = telemetry.pos_mode_expectation.load(std::memory_order_relaxed);
@@ -171,30 +213,37 @@ void dialog_alpha_spectrum::pull_telemetry_into_ui(bool commit_to_settings)
             .arg(pos_brownian_filtered, 0, 'f', 4)
             .arg(pos_brownian_delta, 0, 'f', 4)
             .arg(pos_brownian_damped * 100.0, 0, 'f', 1));
+    ui.telemetry_predictive_error_value->setText(
+        QStringLiteral("%1 / %2")
+            .arg(rot_predictive_error, 0, 'f', 4)
+            .arg(pos_predictive_error, 0, 'f', 4));
     ui.telemetry_rot_contrib_value->setText(
-        QStringLiteral("EMA:%1 Br:%2 Ad:%3 MTM:%4")
+        QStringLiteral("EMA:%1 Br:%2 Ad:%3 Pr:%4 MTM:%5")
             .arg(rot_ema_drive, 0, 'f', 3)
             .arg(rot_brownian_drive, 0, 'f', 3)
             .arg(rot_adaptive_drive, 0, 'f', 3)
+            .arg(rot_predictive_drive, 0, 'f', 3)
             .arg(rot_mtm_drive, 0, 'f', 3));
     ui.telemetry_pos_contrib_value->setText(
-        QStringLiteral("EMA:%1 Br:%2 Ad:%3 MTM:%4")
+        QStringLiteral("EMA:%1 Br:%2 Ad:%3 Pr:%4 MTM:%5")
             .arg(pos_ema_drive, 0, 'f', 3)
             .arg(pos_brownian_drive, 0, 'f', 3)
             .arg(pos_adaptive_drive, 0, 'f', 3)
+            .arg(pos_predictive_drive, 0, 'f', 3)
             .arg(pos_mtm_drive, 0, 'f', 3));
     ui.telemetry_status_value->setText(
         active ?
-            tr("Monitoring | EMA:%1 Brownian:%2 Adaptive:%3 MTM:%4 | rot E:%5 peak:%6 pos E:%7 peak:%8 κ:%9")
-                .arg(*s.ema_enabled ? tr("on") : tr("off"))
-                .arg(*s.brownian_enabled ? tr("on") : tr("off"))
-                .arg(*s.adaptive_mode ? tr("on") : tr("off"))
-                .arg(*s.mtm_enabled ? tr("on") : tr("off"))
-                .arg(rot_mode_expectation, 0, 'f', 3)
-                .arg(rot_mode_peak, 0, 'f', 3)
-                .arg(pos_mode_expectation, 0, 'f', 3)
-                .arg(pos_mode_peak, 0, 'f', 3)
-                .arg(ngc_coupling_residual, 0, 'f', 3)
+            QStringLiteral("Mon|E%1 B%2 A%3 P%4 M%5|rE%6 rP%7 pE%8 pP%9 k%10")
+                .arg(*s.ema_enabled ? 1 : 0)
+                .arg(*s.brownian_enabled ? 1 : 0)
+                .arg(*s.adaptive_mode ? 1 : 0)
+                .arg(*s.predictive_enabled ? 1 : 0)
+                .arg(*s.mtm_enabled ? 1 : 0)
+                .arg(rot_mode_expectation, 5, 'f', 3)
+                .arg(rot_mode_peak, 5, 'f', 3)
+                .arg(pos_mode_expectation, 5, 'f', 3)
+                .arg(pos_mode_peak, 5, 'f', 3)
+                .arg(ngc_coupling_residual, 5, 'f', 3)
             : tr("Idle"));
 
     if (commit_to_settings)
@@ -229,11 +278,19 @@ void dialog_alpha_spectrum::reset_to_defaults()
     s.pos_alpha_max.set_to_default();
     s.pos_curve.set_to_default();
     s.pos_deadzone.set_to_default();
+    s.brownian_head_gain.set_to_default();
+    s.adaptive_threshold_lift.set_to_default();
+    s.predictive_head_gain.set_to_default();
+    s.mtm_shoulder_base.set_to_default();
+    s.ngc_kappa.set_to_default();
+    s.ngc_nominal_z.set_to_default();
     s.adaptive_mode.set_to_default();
     s.ema_enabled.set_to_default();
     s.brownian_enabled.set_to_default();
+    s.predictive_enabled.set_to_default();
     s.mtm_enabled.set_to_default();
-    reload();
+    s.b->save();
+    s.b->reload();
 }
 
 void dialog_alpha_spectrum::doOK()
