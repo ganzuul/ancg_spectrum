@@ -22,6 +22,20 @@ where `motion` is a normalized innovation-energy estimate in `[0, 1]`.
 
 ## Parameters
 
+## UI layout
+
+The settings panel is split into two columns:
+
+- **Left: Hydra / NGC controls**
+  - Brownian Head Gain
+  - Adaptive Threshold Lift
+  - Predictive Head Gain
+  - MTM Shoulder Base
+  - NGC Kappa
+  - NGC Nominal Z
+- **Right: Core EMA controls**
+  - Rotation/Translation Min, Max, Curve, Deadzone
+
 ### Adaptive Mode
 
 - Default: `enabled`
@@ -47,6 +61,7 @@ where `motion` is a normalized innovation-energy estimate in `[0, 1]`.
 ### Reset to defaults
 
 - Use **Reset sliders to defaults** in the settings dialog to restore factory values.
+- This action writes default values to the active profile settings immediately (not just in-memory reload).
 
 ### Rotation Min / Max
 
@@ -113,6 +128,24 @@ Make small moves (`~5-10%` of slider range), then test with:
 - fast snap turn
 - lean in/out
 
+### Two-column quick-start (recommended)
+
+Use this order with the current two-column layout:
+
+1. **Left column (Hydra / NGC)**
+  - Start with defaults.
+  - Tune **MTM Shoulder Base** first for overall trust level.
+  - Tune **Brownian Head Gain** to balance jitter suppression vs response.
+  - Tune **Adaptive Threshold Lift** to control when adaptive boosting engages.
+  - Tune **Predictive Head Gain** while watching **Predictive error (rot/pos)**.
+  - Tune **NGC Kappa** and **NGC Nominal Z** last for translational coupling behavior.
+2. **Right column (Core EMA)**
+  - Set rotation Min/Max/Curve/Deadzone for desired rotational feel.
+  - Set translation Min/Max/Curve/Deadzone for positional feel.
+3. **Validation pass**
+  - Re-test still pose, slow pan, fast snap turn, and lean in/out.
+  - If tuning regresses, use **Reset sliders to defaults** and repeat in the same order.
+
 ## Recommended starting profiles
 
 ### Stable / simulator focus
@@ -158,16 +191,31 @@ Make small moves (`~5-10%` of slider range), then test with:
 - Rotation wrap-around is handled (`±180°` crossing is unwrapped).
 - Recenter resets internal state on the next frame.
 - Brownian telemetry reports `raw / filtered / delta / damped` where `delta = raw - filtered`.
-- Contribution telemetry reports per-family drives: `EMA`, `Brownian`, `MTM`.
+- Contribution telemetry reports per-family drives: `EMA`, `Brownian`, `Adaptive`, `Predictive`, `MTM`.
+
+## Telemetry status format
+
+The status line uses a compact fixed-width format to avoid UI resizing jitter:
+
+- `Mon|E1 B1 A1 P1 M1|rE0.350 rP0.350 pE0.534 pP0.500 k0.000`
+
+Legend:
+
+- `Mon`: telemetry active
+- `E/B/A/P/M`: EMA, Brownian, Adaptive, Predictive, MTM toggles (`1`=on, `0`=off)
+- `rE`, `rP`: rotation mode expectation and peak
+- `pE`, `pP`: translation mode expectation and peak
+- `k`: live NGC coupling residual
 
 ## EMA-head to Rényi-interface bridge
 
-This is now implemented as a **Hydra-style 3-head composition**:
+This is now implemented as a **Hydra-style 4-head composition**:
 
 - EMA head proposes one candidate output.
 - Brownian head proposes a second candidate output.
 - Adaptive head proposes a third candidate output with a stricter activation gate.
-- Rényi neck scores head candidates by q-emphasized residual likelihood.
+- Predictive head proposes a cached next-frame estimate computed after prior-frame output.
+- Rényi/Tsallis neck scores head candidates by generalized likelihood.
 - MTM shoulder composes the neck-normalized heads and applies mode-strength gating.
 - NGC commutator coupling injects depth-scale residual (`κ`) into translational likelihood.
 
@@ -175,6 +223,21 @@ Adaptive head gate detail:
 
 - The Adaptive head uses about a 15% higher activation threshold before it contributes strongly.
 - This makes it a higher-confidence head that activates later than base EMA/Brownian heads.
+
+Predictive head detail:
+
+- After each frame produces final filtered output, the filter computes and stores a one-step-ahead prediction.
+- On the next frame, Predictive head is a direct memory lookup (`predicted_next_output`).
+- Prediction assumes the next frame interval is the same as the measured current frame period.
+
+Non-EMA tuning controls:
+
+- Brownian Head Gain: scales Brownian head drive before alpha synthesis.
+- Adaptive Threshold Lift: raises Adaptive head activation threshold.
+- Predictive Head Gain: scales influence of cached next-frame prediction.
+- MTM Shoulder Base: sets minimum shoulder trust before mode-dependent lift.
+- NGC Kappa: controls depth-scale commutator coupling strength.
+- NGC Nominal Z: reference distance used by NGC coupling term.
 
 The design is head-capacity oriented in code so more heads can be added later without replacing the current composition contract.
 
@@ -184,7 +247,7 @@ This module is now in **Phase A** of a Rényi-MTM style implementation.
 
 - Implemented now:
   - Per-axis adaptive EMA smoothing
-  - Hydra-style three-head composition (EMA + Brownian + Adaptive)
+  - Hydra-style four-head composition (EMA + Brownian + Adaptive + Predictive)
   - True Rényi/Tsallis neck scoring across enabled heads
   - MTM shoulder composition over neck-normalized head candidates
   - NGC depth-scale commutator coupling term in neck residual evaluation
@@ -193,8 +256,9 @@ This module is now in **Phase A** of a Rényi-MTM style implementation.
   - Mode expectation + peak telemetry exposed in the dialog status line
   - Brownian raw/filtered/damped telemetry
   - Brownian-aware instantaneous adaptive drive
-  - Head-share contribution telemetry (`EMA`, `Brownian`, `Adaptive`) and shoulder contribution (`MTM`)
+  - Head-share contribution telemetry (`EMA`, `Brownian`, `Adaptive`, `Predictive`) and shoulder contribution (`MTM`)
   - Live NGC coupling telemetry in status line (`κ`)
+  - Predictive error telemetry (`rot/pos`) for next-frame lookup quality
   - Runtime telemetry surfaced in settings dialog
 - Not implemented yet:
   - Full transition-matrix MTM with explicit regime semantics
