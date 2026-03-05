@@ -29,6 +29,10 @@ This architecture seamlessly resolves both non-commutative and non-associative i
 
 To the best of our knowledge, this architecture represents the state-of-the-art in tracking filter technology, outperforming the Extended Kalman Filter (EKF) in almost every category for highly non-linear, low-latency human kinematics.
 
+## Implementation
+
+The implementation is not monolithic like in the description; it is compliant to engineering choices while the α-Spectrum Filter architecture is its unifying abstraction.
+
 ## Licensing
 
 The generally available version is licensed under the **GNU GPLv3**.
