@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Galganzuul
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
 #pragma once
 
 #include "api/plugin-api.hpp"

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2026
+ * Copyright (C) 2026 Galganzuul
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
